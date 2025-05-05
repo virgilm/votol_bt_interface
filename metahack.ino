@@ -383,19 +383,6 @@ void setup() {
 
   delay(500);
 
-  // run send Data to CAN as a task pinned to core 0
-  BaseType_t bg_task = xTaskCreatePinnedToCore(
-      sendDataToCAN, // callback
-      "SendDataToCAN", // description
-//      4096, // stack size
-      20000, // stack size
-      NULL, // params
-      tskIDLE_PRIORITY | portPRIVILEGE_BIT, // priority
-      NULL,
-      0 // core 0
-      );
-
-
   //enableCore0WDT();
   //enableCore1WDT();
   esp_task_wdt_init(WDT_TIMEOUT, true); //enable panic so ESP32 restarts
