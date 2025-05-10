@@ -24,23 +24,19 @@
 #include <BLEServer.h>
 #include "esp_wifi.h"
 #include <esp_task_wdt.h>
+#define WRITE_MSG_LENGTH 136
+typedef struct {
+    uint8_t data[WRITE_MSG_LENGTH];  // Max message size
+    size_t length;
+} BTMessage;
 QueueHandle_t xQueue;
 // Pay EXTREMELY close attention to the size of the sketch, enabling other modules/libraries might increate the memory requirements above the ESP32 available memory!
 // Currently, Sketch uses 1214449 bytes (92%) of program storage space. Maximum is 1310720 bytes.
 
-/*
-#include "soc/timer_group_struct.h"
-#include "soc/timer_group_reg.h"
-
-TIMERG0.wdt_wprotect=TIMG_WDT_WKEY_VALUE;
-TIMERG0.wdt_feed=1;
-TIMERG0.wdt_wprotect=0;
-*/
-
 //Watchdog timeout
 #define WDT_TIMEOUT 10
 
-// #define FAKE // uncomment this to generate fake messages for app debugging
+#define FAKE // uncomment this to generate fake messages for app debugging
 // #define DEBUG // uncomment this to print debug messages
 // Enabling DEBUG makes things unstable/WD crashes/lost messages, use SPARINGLY!
 // Absoultely no shipping code with DEBUG enabled!
@@ -76,7 +72,6 @@ BLECharacteristic *pCharacteristic;
 #define HDR_SIZE 4
 unsigned char speedo_hdr[HDR_SIZE] = {0x0E, 0x55, 0xAA, 0xAA};
 
-#define WRITE_MSG_LENGTH 136
 unsigned char prbuf[WRITE_MSG_LENGTH * 4]; // extra padding, WRITE_MSG_LENGTH *3 should be enough
 
 bool deviceConnected = false;
@@ -84,9 +79,16 @@ bool deviceConnected = false;
 bool can_received = false;
 int can_packet_size = 0;
 
-bool bt_received = false;
-std::string value;
 int last_core0 = millis();
+
+// Initialization portion
+int last = millis();
+int state = LOW;
+int min_voltage = 690; // 69.0 V
+int max_voltage = 850; // 85.5 V
+int delta_v = 1; //0.1V
+int odometer = 0;
+bool sent = false;
 
 #define DISPLAY_MSG_LENGTH 24
 #define SPEEDO_MSG_LENGTH 9
@@ -172,37 +174,80 @@ void sendCanMessage(unsigned char* body, int length) {
 // task
 void sendDataToCAN(void* arg) {
   esp_task_wdt_add(NULL);
-  std::string msg;
+  BTMessage msg;
   for (;;) {
     unsigned long now = millis();
-    int result = 0;
     if (now - last_core0 >= 500) {
-      result = esp_task_wdt_reset();
+      esp_task_wdt_reset();
 #ifdef DEBUG
-      ESP_DRAM_LOGE("WD0", "Reset WD0 %ld, result %d", now, result);
+      ESP_DRAM_LOGE("WD0", "Reset WD0 %ld, result %d", now);
 #endif
       last_core0 = now;
     }
 
-    if (xQueueReceive( xQueue, &msg, 0 ) == pdPASS) {
-#ifdef DEBUG
-        ESP_DRAM_LOGE("BT Task", "<- %d", msg.length());
-  //        printBuffer8((unsigned char *)(msg.c_str()), msg.length());
-#endif
-      sendCanMessage((unsigned char *)(msg.c_str()), msg.length());
+
+    if (xQueueReceive(xQueue, &msg, pdMS_TO_TICKS(10) ) == pdPASS) {
+      #ifdef DEBUG
+        ESP_DRAM_LOGE("BT Task", "<- %d", (int)msg.length);
+        //        printBuffer8((unsigned char *)(msg.data), msg.length);
+      #endif
+
+      sendCanMessage(msg.data, msg.length);
+    } else {
+        vTaskDelay(1); // prevent starving IDLE tasks and WDT
     }
-//    vTaskDelay(10);
-//    taskYIELD();
   }
 }
 
 
 class BTCallback: public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic *pCharacteristic) {
-  // this gets called when we get BT data
-  // there can be chunks of data, max 20?, usually 16
-    value = pCharacteristic->getValue();
-    bt_received = true;
+void onWrite(BLECharacteristic *pCharacteristic) override {
+    std::string incoming = pCharacteristic->getValue();
+    if (incoming.length() == 0) return; // no data
+
+    // Prepare a queue message
+    BTMessage msg;
+    size_t copyLength = min(incoming.length(), (size_t)WRITE_MSG_LENGTH); // prevent overflow
+    memcpy(msg.data, incoming.c_str(), copyLength);
+    msg.length = copyLength;
+
+#ifndef FAKE
+    // Send to queue (blocks if queue is full — you can also use 0 timeout if you want non-blocking)
+    if (xQueueSend(xQueue, &msg, portMAX_DELAY) != pdTRUE) {
+      #ifdef DEBUG
+      Serial.println("Queue full — BLE message dropped!");
+      #endif
+    }
+
+    #ifdef DEBUG
+    Serial.printf("Enqueued BLE msg length %d\n", (int)msg.length);
+    #endif
+#endif
+
+#ifdef FAKE // check this out!
+    if (incoming[0] == 0x07) {
+      // this is a write
+      sendLongBTMessage(hello_data, WRITE_MSG_LENGTH);
+    } else if (incoming[0] == 0x0A) {
+      // this is a read
+      sendLongBTMessage(hello_data, WRITE_MSG_LENGTH);
+    } else if (incoming[0] == 0x09) {
+      // send fake display response back
+      if ((min_voltage + delta_v) > max_voltage) {
+        delta_v = 0;
+      } else {
+        delta_v = delta_v + 1;
+      }
+      display_data[7] = highByte(min_voltage + delta_v);
+      display_data[8] = lowByte(min_voltage + delta_v);
+      display_data[9] = 10;
+      display_data[10] = random(128);
+      display_data[17] = random(255);
+      display_data[18] = random(175) + 50;
+      display_data[19] = random(175) + 50;
+      sendLongBTMessage(display_data, DISPLAY_MSG_LENGTH);
+    }
+#endif
   }
 };
 
@@ -223,16 +268,6 @@ void sendDataToBT(void* arg) {
   vTaskDelete( NULL );
 }
 */
-
-
-// Initialization portion
-int last = millis();
-int state = LOW;
-int min_voltage = 690; // 69.0 V
-int max_voltage = 850; // 85.5 V
-int delta_v = 1; //0.1V
-int odometer = 0;
-bool sent = false;
 
 // main execution loop
 void loop() {
@@ -306,53 +341,6 @@ void loop() {
       can_received = false;
     }
   }
-  if (bt_received) {
-#ifdef DEBUG
-    ESP_DRAM_LOGE("BTCallback", "MSGLEN %d", value.length());
-#endif
-#ifdef FAKE
-    if (value[0] == 0x07) {
-      // this is a write
-      sendLongBTMessage(hello_data, WRITE_MSG_LENGTH);
-      Serial.println("W->");        
-    } else if (value[0] == 0x0A) {
-      // this is a read
-      sendLongBTMessage(hello_data, WRITE_MSG_LENGTH);
-      Serial.println("R->");        
-    } else if (value[0] == 0x09) {
-      // send fake display response back
-      printBuffer8((unsigned char *) value.c_str(), value.length());
-      // voltage
-      if ((min_voltage + delta_v) > max_voltage) {
-        delta_v = 0;
-      } else {
-        delta_v = delta_v + 1;
-      }
-      display_data[7] = highByte(min_voltage + delta_v);
-      display_data[8] = lowByte(min_voltage + delta_v);
-      // amps
-//      display_data[9] = 0;
-//      display_data[10] = random(128);
-      display_data[9] = 10;
-      display_data[10] = random(128);
-      // rpm low byte
-      display_data[17] = random(255);
-      //temp controller
-      display_data[18] = random(175) + 50;
-      //temp motor
-      display_data[19] = random(175) + 50;
-      sendLongBTMessage(display_data, DISPLAY_MSG_LENGTH);
-      Serial.println("D->");
-    }
-#endif
-#ifndef FAKE
-      sent = xQueueSend( xQueue, &value, portMAX_DELAY );
-#endif
-#ifdef DEBUG
-      ESP_DRAM_LOGE("Queue", "Sent: %s", sent ? "true" : "false");
-#endif
-    bt_received = false;
-  }
 }
 
 // Main BLE Server Callbacks
@@ -394,8 +382,7 @@ void setup() {
 
   Serial.println(F("WiFi disabled!"));
 
-//  xQueue = xQueueCreate(20, 2*sizeof(cdata));
-  xQueue = xQueueCreate(10, 2*sizeof(cdata));
+  xQueue = xQueueCreate(20, sizeof(BTMessage));
   if(xQueue != NULL) {
     xTaskCreatePinnedToCore(
       sendDataToCAN, // callback
@@ -408,7 +395,8 @@ void setup() {
       );
 //    vTaskStartScheduler();
   } else {
-    Serial.println(F("Queue Init failed!"));
+    Serial.println(F("Waiting for BT Queue Init ..."));
+    while (1);
   }
 
 // Normal ESP32 board
