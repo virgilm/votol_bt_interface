@@ -29,30 +29,14 @@ typedef struct {
     uint8_t data[WRITE_MSG_LENGTH];  // Max message size
     size_t length;
 } BTMessage;
-typedef struct {
-    int id;             // CAN ID
-    uint8_t length;     // number of bytes in the data
-    uint8_t data[8];    // CAN frames can only hold up to 8 bytes
-} CANMessage;
-QueueHandle_t xQueue;    // for BT → CAN messages
-QueueHandle_t canQueue;  // for CAN → BT messages
-
+QueueHandle_t xQueue;
 // Pay EXTREMELY close attention to the size of the sketch, enabling other modules/libraries might increate the memory requirements above the ESP32 available memory!
 // Currently, Sketch uses 1214449 bytes (92%) of program storage space. Maximum is 1310720 bytes.
-
-// Initialization portion
-int last = millis();
-int state = LOW;
-int min_voltage = 690; // 69.0 V
-int max_voltage = 850; // 85.5 V
-int delta_v = 1; //0.1V
-int odometer = 0;
-bool sent = false;
 
 //Watchdog timeout
 #define WDT_TIMEOUT 10
 
-// #define FAKE // uncomment this to generate fake messages for app debugging
+#define FAKE // uncomment this to generate fake messages for app debugging
 // #define DEBUG // uncomment this to print debug messages
 // Enabling DEBUG makes things unstable/WD crashes/lost messages, use SPARINGLY!
 // Absoultely no shipping code with DEBUG enabled!
@@ -92,7 +76,19 @@ unsigned char prbuf[WRITE_MSG_LENGTH * 4]; // extra padding, WRITE_MSG_LENGTH *3
 
 bool deviceConnected = false;
 
+bool can_received = false;
+int can_packet_size = 0;
+
 int last_core0 = millis();
+
+// Initialization portion
+int last = millis();
+int state = LOW;
+int min_voltage = 690; // 69.0 V
+int max_voltage = 850; // 85.5 V
+int delta_v = 1; //0.1V
+int odometer = 0;
+bool sent = false;
 
 #define DISPLAY_MSG_LENGTH 24
 #define SPEEDO_MSG_LENGTH 9
@@ -179,7 +175,6 @@ void sendCanMessage(unsigned char* body, int length) {
 void sendDataToCAN(void* arg) {
   esp_task_wdt_add(NULL);
   BTMessage msg;
-
   for (;;) {
     unsigned long now = millis();
     // Keep the watchdog happy
@@ -253,7 +248,6 @@ class BTCallback: public BLECharacteristicCallbacks {
       sendLongBTMessage(display_data, DISPLAY_MSG_LENGTH);
     }
 #endif
-
   }
 };
 
@@ -329,6 +323,9 @@ void loop() {
       } else {
           // Should never happen
       }
+      // xTaskCreate(sendDataToBT, "SendDataToBT", 4096, static_cast<void*>(&packetSize), tskIDLE_PRIORITY, NULL);
+      can_received = false;
+    }
   }
 }
 
@@ -369,7 +366,7 @@ void setup() {
 
   Serial.println(F("WiFi disabled!"));
 
-  xQueue = xQueueCreate(10, sizeof(BTMessage));
+  xQueue = xQueueCreate(20, sizeof(BTMessage));
   if(xQueue != NULL) {
     xTaskCreatePinnedToCore(
       sendDataToCAN, // callback
