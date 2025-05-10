@@ -25,7 +25,7 @@ You are free to copy, modify, and share this project **for non-commercial purpos
 
 # Tested good setup as of Sept 2024
 
-## Install Arduino IDE version 2.3.3
+## Install Arduino IDE version 2.3.6
 Other versions might work
 
 ## Libraries
