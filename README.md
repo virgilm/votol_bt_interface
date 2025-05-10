@@ -23,7 +23,7 @@ This work is licensed under the [Creative Commons Attribution-NonCommercial-Shar
 
 You are free to copy, modify, and share this project **for non-commercial purposes only**, as long as you give credit and license your new creations under the same terms.
 
-# Tested good setup as of Sept 2024
+# Tested good setup as of May 2025
 
 ## Install Arduino IDE version 2.3.6
 Other versions might work
@@ -43,8 +43,12 @@ from https://github.com/plerup/espsoftwareserial/
 Under Tools->Boards Manager, add the following board
 
 ### ESP32 by Espressif Systems version 2.0.17
-Version 3.x has a different way to deal with watchdogs at a minimum - needs investigation!
+
 from https://github.com/espressif/arduino-esp32
+
+Version 3.x has
+ - a different way to deal with watchdogs - easy fix
+ - CAN library is not working anymore, made an attempt to use TWAI CAN library - fail
 
 ## Load sketch (metahack.ino)
 
