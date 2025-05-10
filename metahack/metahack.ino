@@ -177,15 +177,16 @@ void sendDataToCAN(void* arg) {
   BTMessage msg;
   for (;;) {
     unsigned long now = millis();
+    // Keep the watchdog happy
     if (now - last_core0 >= 500) {
       esp_task_wdt_reset();
 #ifdef DEBUG
-      ESP_DRAM_LOGE("WD0", "Reset WD0 %ld, result %d", now);
+      ESP_DRAM_LOGE("WD0", "Reset WD0 %ld", now);
 #endif
       last_core0 = now;
     }
 
-
+    // Wait for next BLE -> CAN message
     if (xQueueReceive(xQueue, &msg, pdMS_TO_TICKS(10) ) == pdPASS) {
       #ifdef DEBUG
         ESP_DRAM_LOGE("BT Task", "<- %d", (int)msg.length);
@@ -199,9 +200,8 @@ void sendDataToCAN(void* arg) {
   }
 }
 
-
 class BTCallback: public BLECharacteristicCallbacks {
-void onWrite(BLECharacteristic *pCharacteristic) override {
+  void onWrite(BLECharacteristic *pCharacteristic) override {
     std::string incoming = pCharacteristic->getValue();
     if (incoming.length() == 0) return; // no data
 
@@ -252,22 +252,22 @@ void onWrite(BLECharacteristic *pCharacteristic) override {
 };
 
 void IRAM_ATTR CANCallback(int packetSize) {
-  // this gets called when we get CAN data
-  can_received = true;
-  can_packet_size = packetSize;
-}
+    if (!canQueue) return;  // Bail out if queue not ready
 
-/*
-void sendDataToBT(void* arg) {
-  int &len = *(static_cast<int*>(arg));
-  CAN.readBytes(cdata, len);
-  // printBuffer8(cdata, len);
-  pCharacteristic->setValue(cdata, len);
-  pCharacteristic->notify();
-
-  vTaskDelete( NULL );
+    if (packetSize > 0 && packetSize <= 8) {
+        CANMessage msg;
+        msg.id = CAN.packetId();
+        msg.length = packetSize;
+        CAN.readBytes(msg.data, packetSize);
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        if (xQueueSendFromISR(canQueue, &msg, &xHigherPriorityTaskWoken) != pdTRUE) {
+          #ifdef DEBUG
+          ESP_DRAM_LOGE("CAN ISR", "CAN queue full — packet dropped!");
+          #endif
+        }
+        if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
+    }
 }
-*/
 
 // main execution loop
 void loop() {
@@ -300,42 +300,28 @@ void loop() {
       }
 #endif
   } // end of LED blinking and periodic WD reset
-  if (can_received) {
-    if (can_packet_size != 0) {
-      id = CAN.packetId();
-      if (id == SPEEDO_MSG_ID) {
-        speedo_count += 1;
-        if (speedo_count == SPEEDO_MULTI) {
-          // send one copy every SPEEDO_MULTI intervals
-          // attach the header
-          CAN.readBytes(cdata, can_packet_size);
-#ifdef DEBUG
-          ESP_DRAM_LOGE("CANCallback", " S-> %d", can_packet_size);
-#endif
-          memcpy(prbuf, speedo_hdr, HDR_SIZE);
-          memcpy(prbuf + HDR_SIZE, cdata, can_packet_size);
-          pCharacteristic->setValue(prbuf, HDR_SIZE + can_packet_size);
+
+  // deal with incoming CAN messages
+  CANMessage incoming;
+  if (xQueueReceive(canQueue, &incoming, 0) == pdPASS) {
+      if (incoming.id == SPEEDO_MSG_ID) {
+          speedo_count += 1;
+          if (speedo_count == SPEEDO_MULTI) {
+              memcpy(prbuf, speedo_hdr, HDR_SIZE);
+              memcpy(prbuf + HDR_SIZE, incoming.data, incoming.length);
+              pCharacteristic->setValue(prbuf, HDR_SIZE + incoming.length);
+              pCharacteristic->notify();
+              speedo_count = 0;
+          }
+      } else if (incoming.id == FROM_CONTROLLER_CAN_ID) {
+          pCharacteristic->setValue(incoming.data, incoming.length);
           pCharacteristic->notify();
-          speedo_count = 0;
-        }
-      } else if (id == FROM_CONTROLLER_CAN_ID) {
-        CAN.readBytes(cdata, can_packet_size);
-#ifdef DEBUG
-        ESP_DRAM_LOGE("CANCallback", " C-> %d", can_packet_size);
-#endif
-        // printBuffer8(cdata, packetSize);
-        pCharacteristic->setValue(cdata, can_packet_size);
-        pCharacteristic->notify();
-      } else if (id == TO_CONTROLLER_CAN_ID) {
-#ifdef DEBUG
-          ESP_DRAM_LOGE("CANCallback", " C <- %d", can_packet_size);
-#endif
-    //    Serial.println("Only in debug mode");
-    //    CAN.readBytes(cdata, packetSize);
-    //    printBuffer8(cdata, packetSize);
+      } else if (incoming.id == TO_CONTROLLER_CAN_ID) {
+  #ifdef DEBUG
+          ESP_DRAM_LOGE("CANCallback", " C <- %d", incoming.length);
+  #endif
       } else {
-    //    Serial.print(id);
-    //    Serial.println(" Should never happen!");
+          // Should never happen
       }
       // xTaskCreate(sendDataToBT, "SendDataToBT", 4096, static_cast<void*>(&packetSize), tskIDLE_PRIORITY, NULL);
       can_received = false;
@@ -371,8 +357,6 @@ void setup() {
 
   delay(500);
 
-  //enableCore0WDT();
-  //enableCore1WDT();
   esp_task_wdt_init(WDT_TIMEOUT, true); //enable panic so ESP32 restarts
   esp_task_wdt_add(NULL); //add current thread to WDT watch
 
@@ -393,11 +377,17 @@ void setup() {
       NULL,
       0 // core 0
       );
-//    vTaskStartScheduler();
   } else {
     Serial.println(F("Waiting for BT Queue Init ..."));
     while (1);
   }
+
+  canQueue = xQueueCreate(10, sizeof(CANMessage));
+
+  if (canQueue == NULL) {
+    Serial.println(F("Waiting for CAN Queue Init ..."));
+    while (1);
+}
 
 // Normal ESP32 board
    CAN.setPins(GPIO_NUM_25, GPIO_NUM_26);

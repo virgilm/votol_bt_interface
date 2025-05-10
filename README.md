@@ -65,6 +65,7 @@ RED LED will turn ON when power is applied
 Serial Console should say
 
 ```
+Serial init ok!
 WiFi disabled!
 CAN init ok!
 BT init ok!
