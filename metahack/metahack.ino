@@ -36,7 +36,7 @@ QueueHandle_t xQueue;
 //Watchdog timeout
 #define WDT_TIMEOUT 10
 
-#define FAKE // uncomment this to generate fake messages for app debugging
+// #define FAKE // uncomment this to generate fake messages for app debugging
 // #define DEBUG // uncomment this to print debug messages
 // Enabling DEBUG makes things unstable/WD crashes/lost messages, use SPARINGLY!
 // Absoultely no shipping code with DEBUG enabled!
@@ -252,21 +252,9 @@ class BTCallback: public BLECharacteristicCallbacks {
 };
 
 void IRAM_ATTR CANCallback(int packetSize) {
-    if (!canQueue) return;  // Bail out if queue not ready
-
-    if (packetSize > 0 && packetSize <= 8) {
-        CANMessage msg;
-        msg.id = CAN.packetId();
-        msg.length = packetSize;
-        CAN.readBytes(msg.data, packetSize);
-        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-        if (xQueueSendFromISR(canQueue, &msg, &xHigherPriorityTaskWoken) != pdTRUE) {
-          #ifdef DEBUG
-          ESP_DRAM_LOGE("CAN ISR", "CAN queue full — packet dropped!");
-          #endif
-        }
-        if (xHigherPriorityTaskWoken) portYIELD_FROM_ISR();
-    }
+  // this gets called when we get CAN data
+  can_received = true;
+  can_packet_size = packetSize;
 }
 
 // main execution loop
@@ -301,27 +289,42 @@ void loop() {
 #endif
   } // end of LED blinking and periodic WD reset
 
-  // deal with incoming CAN messages
-  CANMessage incoming;
-  if (xQueueReceive(canQueue, &incoming, 0) == pdPASS) {
-      if (incoming.id == SPEEDO_MSG_ID) {
-          speedo_count += 1;
-          if (speedo_count == SPEEDO_MULTI) {
-              memcpy(prbuf, speedo_hdr, HDR_SIZE);
-              memcpy(prbuf + HDR_SIZE, incoming.data, incoming.length);
-              pCharacteristic->setValue(prbuf, HDR_SIZE + incoming.length);
-              pCharacteristic->notify();
-              speedo_count = 0;
-          }
-      } else if (incoming.id == FROM_CONTROLLER_CAN_ID) {
-          pCharacteristic->setValue(incoming.data, incoming.length);
+  if (can_received) {
+    if (can_packet_size != 0) {
+      id = CAN.packetId();
+      if (id == SPEEDO_MSG_ID) {
+        speedo_count += 1;
+        if (speedo_count == SPEEDO_MULTI) {
+          // send one copy every SPEEDO_MULTI intervals
+          // attach the header
+          CAN.readBytes(cdata, can_packet_size);
+#ifdef DEBUG
+          ESP_DRAM_LOGE("CANCallback", " S-> %d", can_packet_size);
+#endif
+          memcpy(prbuf, speedo_hdr, HDR_SIZE);
+          memcpy(prbuf + HDR_SIZE, cdata, can_packet_size);
+          pCharacteristic->setValue(prbuf, HDR_SIZE + can_packet_size);
           pCharacteristic->notify();
-      } else if (incoming.id == TO_CONTROLLER_CAN_ID) {
-  #ifdef DEBUG
-          ESP_DRAM_LOGE("CANCallback", " C <- %d", incoming.length);
-  #endif
+          speedo_count = 0;
+        }
+      } else if (id == FROM_CONTROLLER_CAN_ID) {
+        CAN.readBytes(cdata, can_packet_size);
+#ifdef DEBUG
+        ESP_DRAM_LOGE("CANCallback", " C-> %d", can_packet_size);
+#endif
+        // printBuffer8(cdata, packetSize);
+        pCharacteristic->setValue(cdata, can_packet_size);
+        pCharacteristic->notify();
+      } else if (id == TO_CONTROLLER_CAN_ID) {
+#ifdef DEBUG
+          ESP_DRAM_LOGE("CANCallback", " C <- %d", can_packet_size);
+#endif
+    //    Serial.println("Only in debug mode");
+    //    CAN.readBytes(cdata, packetSize);
+    //    printBuffer8(cdata, packetSize);
       } else {
-          // Should never happen
+    //    Serial.print(id);
+    //    Serial.println(" Should never happen!");
       }
       // xTaskCreate(sendDataToBT, "SendDataToBT", 4096, static_cast<void*>(&packetSize), tskIDLE_PRIORITY, NULL);
       can_received = false;
@@ -381,13 +384,6 @@ void setup() {
     Serial.println(F("Waiting for BT Queue Init ..."));
     while (1);
   }
-
-  canQueue = xQueueCreate(10, sizeof(CANMessage));
-
-  if (canQueue == NULL) {
-    Serial.println(F("Waiting for CAN Queue Init ..."));
-    while (1);
-}
 
 // Normal ESP32 board
    CAN.setPins(GPIO_NUM_25, GPIO_NUM_26);
