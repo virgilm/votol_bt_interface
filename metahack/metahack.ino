@@ -15,9 +15,14 @@
 // VERY TRICKY TO DEBUG!
 // For any debugging, use the highest possible baud rate for the serial (debug) port
 
-#include <CAN.h>
+// #include <CAN.h>
 // Multiple versions available, Originally used https://github.com/sandeepmistry/arduino-CAN
 // Use https://github.com/avlasic/arduino-CAN/tree/patch-1 (fork from https://github.com/sandeepmistry/arduino-CAN) due to a bug (as of Sept 2024)
+#include <Arduino.h>
+// Note: The arduino-CAN library include is removed. Using built-in TWAI driver:
+#include "driver/twai.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include <BLEDevice.h>
 #include <BLEUtils.h>
@@ -148,6 +153,161 @@ void printBuffer8(unsigned char *print_buffer, int length) {
     }
 }
 
+// CAN bus pins and speed configuration
+#define CAN_TX_PIN 25
+#define CAN_RX_PIN 26
+#define CAN_BUS_SPEED 500000  // 500 kbps
+
+// CAN interface object to mimic arduino-CAN library API using TWAI
+struct CANDriver {
+  // TWAI message structures for TX and RX
+  twai_message_t tx_msg;
+  twai_message_t rx_msg;
+  // Indices for buffering data
+  uint8_t tx_index;
+  uint8_t rx_index;
+  bool driver_started;
+
+  bool begin(long baudRate) {
+    // Configure TWAI general, timing, and filter settings
+    twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT((gpio_num_t)CAN_TX_PIN, (gpio_num_t)CAN_RX_PIN, TWAI_MODE_NORMAL);
+    twai_timing_config_t t_config;
+    if (baudRate == 500000 || baudRate == 500E3) {
+      t_config = TWAI_TIMING_CONFIG_500KBITS();
+    } else {
+      // Default to 500 kbps if other baud rate is provided
+      t_config = TWAI_TIMING_CONFIG_500KBITS();
+    }
+
+    twai_filter_config_t f_config = {
+      .acceptance_code = (1U << 2),     // Match any extended frame
+      .acceptance_mask = ~(1U << 2),    // Only care about EX flag
+      .single_filter = true
+    };
+
+    // Install and start the TWAI driver
+    if (twai_driver_install(&g_config, &t_config, &f_config) != ESP_OK) {
+      return false;
+    }
+    if (twai_start() != ESP_OK) {
+      return false;
+    }
+    driver_started = true;
+    return true;
+  }
+
+  bool beginPacket(long id) {
+    return beginPacket(id, 0, false);
+  }
+  bool beginPacket(long id, uint8_t len) {
+    return beginPacket(id, len, false);
+  }
+  bool beginPacket(long id, uint8_t len, bool rtr) {
+    // Initialize transmit message
+    tx_index = 0;
+    tx_msg.identifier = (uint32_t)id;
+    tx_msg.extd = (id > 0x7FF) ? 1 : 0;      // use extended frame if ID > 11-bit max
+    tx_msg.rtr = rtr ? 1 : 0;               // remote transmission request flag
+    if (rtr) {
+      // RTR frame: set requested data length (no actual data to send)
+      tx_msg.data_length_code = len;
+    } else {
+      tx_msg.data_length_code = 0;
+    }
+    return true;
+  }
+
+  size_t write(uint8_t value) {
+    // Write a single byte to the transmit buffer (if space allows)
+    if (tx_index < 8) {
+      tx_msg.data[tx_index++] = value;
+      return 1;
+    }
+    return 0;
+  }
+  size_t write(const uint8_t *buffer, size_t length) {
+    // Write multiple bytes to the transmit buffer
+    size_t count = 0;
+    while (count < length && tx_index < 8) {
+      tx_msg.data[tx_index++] = buffer[count++];
+    }
+    return count;
+  }
+
+  bool endPacket() {
+    // Finalize and send the CAN frame
+    if (tx_msg.rtr == 0) {
+      // For data frames, set DLC to number of bytes written
+      tx_msg.data_length_code = tx_index;
+    }
+    // Transmit the message (wait up to 100ms for queue availability)
+    esp_err_t err = twai_transmit(&tx_msg, pdMS_TO_TICKS(100));
+    return (err == ESP_OK);
+  }
+
+  int parsePacket() {
+    if (!driver_started) {
+      return 0;
+    }
+    // Check for an incoming CAN frame (non-blocking)
+    twai_message_t message;
+    if (twai_receive(&message, 0) == ESP_OK) {
+      // Store received message and reset read index
+      rx_msg = message;
+      rx_index = 0;
+      // Return the DLC (number of bytes) of the received packet.
+      // (If RTR frame, DLC is the requested length, but no data bytes are present.)
+      return rx_msg.data_length_code;
+    }
+    return 0;
+  }
+
+  long packetId() {
+    // Return the 11-bit or 29-bit identifier of the received packet
+    return (long)rx_msg.identifier;
+  }
+  bool packetExtended() {
+    // Return true if the received packet used an extended 29-bit ID
+    return (bool)rx_msg.extd;
+  }
+  bool packetRtr() {
+    // Return true if the received packet is a Remote Transmission Request frame
+    return (bool)rx_msg.rtr;
+  }
+  uint8_t packetDlc() {
+    // Return the DLC (data length code) of the received packet
+    return rx_msg.data_length_code;
+  }
+
+  int available() {
+    // Return number of bytes remaining to read from the current packet
+    if (rx_msg.rtr) {
+      return 0;
+    }
+    return rx_msg.data_length_code - rx_index;
+  }
+  int read() {
+    // Read the next byte from the received packet
+    if (rx_msg.rtr || rx_index >= rx_msg.data_length_code) {
+      return -1;  // no data available or RTR frame has no data
+    }
+    return rx_msg.data[rx_index++];
+  }
+  int readBytes(uint8_t *buffer, size_t length) {
+    // Read multiple bytes from the received packet into buffer
+    if (rx_msg.rtr || rx_index >= rx_msg.data_length_code) {
+      return 0;
+    }
+    size_t bytes_to_read = rx_msg.data_length_code - rx_index;
+    if (bytes_to_read > length) {
+      bytes_to_read = length;
+    }
+    memcpy(buffer, rx_msg.data + rx_index, bytes_to_read);
+    rx_index += bytes_to_read;
+    return bytes_to_read;
+  }
+} CAN;
+
 // send to CAN bus
 void sendCanMessage(unsigned char* body, int length) {
   int sent_bytes = 0;
@@ -202,7 +362,7 @@ void sendDataToCAN(void* arg) {
 
 class BTCallback: public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *pCharacteristic) override {
-    std::string incoming = pCharacteristic->getValue();
+    String incoming = pCharacteristic->getValue();
     if (incoming.length() == 0) return; // no data
 
     // Prepare a queue message
@@ -251,10 +411,36 @@ class BTCallback: public BLECharacteristicCallbacks {
   }
 };
 
-void IRAM_ATTR CANCallback(int packetSize) {
-  // this gets called when we get CAN data
-  can_received = true;
-  can_packet_size = packetSize;
+void receiveTask(void *arg) {
+  twai_message_t message;
+
+  for (;;) {
+    if (twai_receive(&message, pdMS_TO_TICKS(10)) == ESP_OK) {
+      if (message.extd) {
+        int id = message.identifier;
+
+        if (id == SPEEDO_MSG_ID) {
+          speedo_count++;
+          if (speedo_count == SPEEDO_MULTI) {
+            memcpy(cdata, message.data, message.data_length_code);
+            memcpy(prbuf, speedo_hdr, HDR_SIZE);
+            memcpy(prbuf + HDR_SIZE, cdata, message.data_length_code);
+            pCharacteristic->setValue(prbuf, HDR_SIZE + message.data_length_code);
+            pCharacteristic->notify();
+            speedo_count = 0;
+          }
+        } else if (id == FROM_CONTROLLER_CAN_ID) {
+          memcpy(cdata, message.data, message.data_length_code);
+          pCharacteristic->setValue(cdata, message.data_length_code);
+          pCharacteristic->notify();
+        } else if (id == TO_CONTROLLER_CAN_ID) {
+          // Optional: handle echo or ignore
+        }
+      }
+    } else {
+      vTaskDelay(1);
+    }
+  }
 }
 
 // main execution loop
@@ -289,47 +475,6 @@ void loop() {
 #endif
   } // end of LED blinking and periodic WD reset
 
-  if (can_received) {
-    if (can_packet_size != 0) {
-      id = CAN.packetId();
-      if (id == SPEEDO_MSG_ID) {
-        speedo_count += 1;
-        if (speedo_count == SPEEDO_MULTI) {
-          // send one copy every SPEEDO_MULTI intervals
-          // attach the header
-          CAN.readBytes(cdata, can_packet_size);
-#ifdef DEBUG
-          ESP_DRAM_LOGE("CANCallback", " S-> %d", can_packet_size);
-#endif
-          memcpy(prbuf, speedo_hdr, HDR_SIZE);
-          memcpy(prbuf + HDR_SIZE, cdata, can_packet_size);
-          pCharacteristic->setValue(prbuf, HDR_SIZE + can_packet_size);
-          pCharacteristic->notify();
-          speedo_count = 0;
-        }
-      } else if (id == FROM_CONTROLLER_CAN_ID) {
-        CAN.readBytes(cdata, can_packet_size);
-#ifdef DEBUG
-        ESP_DRAM_LOGE("CANCallback", " C-> %d", can_packet_size);
-#endif
-        // printBuffer8(cdata, packetSize);
-        pCharacteristic->setValue(cdata, can_packet_size);
-        pCharacteristic->notify();
-      } else if (id == TO_CONTROLLER_CAN_ID) {
-#ifdef DEBUG
-          ESP_DRAM_LOGE("CANCallback", " C <- %d", can_packet_size);
-#endif
-    //    Serial.println("Only in debug mode");
-    //    CAN.readBytes(cdata, packetSize);
-    //    printBuffer8(cdata, packetSize);
-      } else {
-    //    Serial.print(id);
-    //    Serial.println(" Should never happen!");
-      }
-      // xTaskCreate(sendDataToBT, "SendDataToBT", 4096, static_cast<void*>(&packetSize), tskIDLE_PRIORITY, NULL);
-      can_received = false;
-    }
-  }
 }
 
 // Main BLE Server Callbacks
@@ -360,8 +505,14 @@ void setup() {
 
   delay(500);
 
-  esp_task_wdt_init(WDT_TIMEOUT, true); //enable panic so ESP32 restarts
-  esp_task_wdt_add(NULL); //add current thread to WDT watch
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = WDT_TIMEOUT*1000,       // 10 seconds
+    .idle_core_mask = 1,       // Core 0
+    .trigger_panic = true
+  };
+
+  esp_task_wdt_init(&wdt_config);  // updated API
+  esp_task_wdt_add(NULL);          // Add current task to WDT
 
   Serial.println(F("Serial init ok!"));
 
@@ -385,15 +536,21 @@ void setup() {
     while (1);
   }
 
-// Normal ESP32 board
-   CAN.setPins(GPIO_NUM_25, GPIO_NUM_26);
-// LOLIN32 board? - NOT WORKING YET
-//  CAN.setPins(GPIO_NUM_22, GPIO_NUM_21);
+  xTaskCreatePinnedToCore(
+    receiveTask,
+    "CANReceiveTask",
+    4096,
+    NULL,
+    1,
+    NULL,
+    0
+  );
 
-  if (!CAN.begin(500E3)) {
-    Serial.println("Starting CAN failed!");
+  if (!CAN.begin(CAN_BUS_SPEED)) {
+    Serial.println("CAN initialization failed!");
     while (1);
   }
+
 
 // CAN filtering does not work as expected. Ideally, we should only filter for 3 messages (FROM_CONTROLLER_CAN_ID, TO_CONTROLLER_CAN_ID & SPEEDO_MSG_ID)
 // in practice that does not seem to work properly!
@@ -405,7 +562,7 @@ void setup() {
 // adding this line breaks everything!!
 //  CAN.filterExtended(SPEEDO_MSG_ID, 0x1FFFFFFF);    // filter display messages
 
-  CAN.filter(0x8, 0x8);
+  // CAN.filter(0x8, 0x8);
   // this is a manual OR between the SPPEDO & FROM_CONTROLLER_CAN_ID
   // might accept other packets too, as it only tests 1 bit
   // still better than nothing
@@ -413,7 +570,7 @@ void setup() {
   // https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/peripherals/twai.html#overview
   // http://media3.evtv.me/ESP32CANDue.pdf
 
-  CAN.onReceive(CANCallback);
+  //CAN.onReceive(CANCallback);
 
   Serial.println(F("CAN init ok!"));
 
