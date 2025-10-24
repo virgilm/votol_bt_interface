@@ -77,3 +77,26 @@ BT init ok!
 
 BLUE LED will turn ON and start blinking when BT connection with the app is established.
 
+## Simulator Mode
+
+This project now includes a **SIMULATOR mode** that allows testing without physical CAN hardware! 🎯
+
+In simulator mode, the ESP32:
+- Loads controller configuration from a file stored in SPIFFS
+- Responds to BT read/write commands using simulated memory
+- Saves configuration changes back to the file system
+- Works completely standalone without CAN bus connection
+
+### Quick Start
+
+1. **Enable simulator mode**: Uncomment `#define SIMULATOR` in `metahack.ino`
+2. **Upload config file**: Use Arduino IDE's "ESP32 Sketch Data Upload" to upload the `data/` folder
+3. **Upload sketch**: Compile and upload to ESP32
+4. **Connect and test**: Your BT app will work exactly as with real hardware!
+
+📖 **See detailed documentation:**
+- [Quick Start Guide](SIMULATOR_QUICKSTART.md) - Get running in 5 minutes
+- [Complete Documentation](SIMULATOR_README.md) - Full simulator mode reference
+
+Perfect for app development, testing, and demonstrations without needing the full hardware setup!
+

@@ -24,6 +24,8 @@
 #include <BLEServer.h>
 #include "esp_wifi.h"
 #include <esp_task_wdt.h>
+#include <LittleFS.h>
+
 #define WRITE_MSG_LENGTH 136
 typedef struct {
     uint8_t data[WRITE_MSG_LENGTH];  // Max message size
@@ -37,6 +39,7 @@ QueueHandle_t xQueue;
 #define WDT_TIMEOUT 10
 
 // #define FAKE // uncomment this to generate fake messages for app debugging
+// #define SIMULATOR // uncomment this to enable simulator mode with config file loading
 // #define DEBUG // uncomment this to print debug messages
 // Enabling DEBUG makes things unstable/WD crashes/lost messages, use SPARINGLY!
 // Absoultely no shipping code with DEBUG enabled!
@@ -57,7 +60,6 @@ const int LED_BUILTIN = 2; // BLUE LED
 #define FROM_CONTROLLER_CAN_ID 0x3fe
 #define TO_CONTROLLER_CAN_ID   0x3ff
 #define SPEEDO_MSG_ID 0x1026105A
-
 #define SPEEDO_MULTI 4 // send every 4 messages, each 1 sec
 int speedo_count = 0;
 int id;
@@ -92,6 +94,15 @@ bool sent = false;
 
 #define DISPLAY_MSG_LENGTH 24
 #define SPEEDO_MSG_LENGTH 9
+#define CONFIG_DATA_SIZE 119
+#define CONFIG_FILE_PATH "/config.ini"
+
+// Simulator mode - controller memory storage
+#if defined(SIMULATOR)
+unsigned char simulatorConfig[CONFIG_DATA_SIZE] = {0};
+bool configLoaded = false;
+int fillLevel = 0;
+#endif
 
 // Fake data, to be used when FAKE is defined
 unsigned char display_data[DISPLAY_MSG_LENGTH] = {0x09, 0x55, 0xAA, 0xAA, 0x00, 0x00, 0x00, 0x02,
@@ -115,6 +126,106 @@ unsigned char hello_data[WRITE_MSG_LENGTH] = {0x07, 0x55, 0xAA, 0xAA, 0x00, 0xAA
                                 0xcb, 0x00, 0x3a, 0xc7, 0x0f, 0xdf, 0x52, 0xff,
                                 0x00, 0x00, 0x00, 0x00, 0x51, 0x00, 0xd2, 0x05,
                                 0x00, 0x00, 0x00, 0xc3, 0xcd, 0x00, 0x00, 0x00};
+
+// Simulator mode functions
+#if defined(SIMULATOR)
+// please note that these are 1 based, not 0 based!!
+const int swapIndices[] = {3, 5, 8, 10, 12, 14, 16, 18, 23, 25, 27, 35, 40, 42, 44, 53, 55, 57, 62, 64, 66, 69, 71, 73, 75, 77, 79, 81, 83, 86, 88, 90, 92, 94, 96, 98, 100, 109, 111};
+const int swapCount = sizeof(swapIndices) / sizeof(swapIndices[0]);
+
+// Swap byte pairs in simulator config (for endianness conversion)
+void swapBytePairs(unsigned char* config, const int* indices, int count) {
+  for (int i = 0; i < count; i++) {
+    int idx = indices[i];
+    if (idx >= 1 && idx < (CONFIG_DATA_SIZE)) {
+      unsigned char temp = config[idx-1];
+      config[idx - 1] = config[idx];
+      config[idx] = temp;
+    }
+  }
+}
+
+bool loadConfigFromFile() {
+// Load configuration from file
+  File file = LittleFS.open(CONFIG_FILE_PATH, "r");
+  if (!file) {
+    Serial.println("Failed to open config file for reading");
+    return false;
+  }
+
+  int byteIndex = 0;
+  while (file.available() && byteIndex < CONFIG_DATA_SIZE) {
+    String line = file.readStringUntil('\n');
+    line.trim();
+    if (line.length() > 0) {
+      int value = line.toInt();
+      simulatorConfig[byteIndex] = (unsigned char )(value & 0xFF);
+#ifdef DEBUG
+      Serial.printf("Loaded index %d value %d \n", byteIndex, simulatorConfig[byteIndex]);
+#endif
+      byteIndex++;
+    }
+  }
+  file.close();
+
+  swapBytePairs(simulatorConfig, swapIndices, swapCount);
+  
+  Serial.printf("Loaded %d bytes from config file\n", byteIndex);
+  return (byteIndex == CONFIG_DATA_SIZE);
+}
+
+// Save configuration to file
+bool saveConfigToFile() {
+  File file = LittleFS.open(CONFIG_FILE_PATH, "w");
+  if (!file) {
+    Serial.println("Failed to open config file for reading");
+    return false;
+  }
+
+//  swapBytePairs(simulatorConfig, swapIndices, swapCount);
+
+  for (int i = 0; i < CONFIG_DATA_SIZE; i++) {
+    file.printf("%d\n", simulatorConfig[i]);
+#ifdef DEBUG
+    Serial.printf("Byte %d written at %d\n", simulatorConfig[i], i);
+#endif
+  }
+  file.close();
+  
+  Serial.println("Config saved to file");
+  return true;
+}
+
+// Build hello_data message from simulator config
+void buildHelloDataFromConfig() {
+  // Start with standard header
+  hello_data[0] = 0x07;
+  hello_data[1] = 0x55;
+  hello_data[2] = 0xAA;
+  hello_data[3] = 0xAA;
+  
+  // Copy config data (119 bytes) into hello_data starting at offset 4
+  // hello_data is 136 bytes total
+  for (int i = 0; i < CONFIG_DATA_SIZE && (i + 12) < WRITE_MSG_LENGTH; i++) {
+    hello_data[i + 12] = simulatorConfig[i];
+  }
+  // needs CRC or CRC should be ignored in iOS
+}
+
+// Update simulator config from incoming write message
+void updateConfigFromMessage(const uint8_t* data, size_t length) {
+  // Write message format: [0x0A, 0x55, 0xAA, 0xAA, ...data bytes...]
+  Serial.printf("Write request: \n");
+  
+  // Copy data bytes into simulator config
+  for (int i = 0; i < length; i++) {
+    simulatorConfig[i] = data[12 + i];
+  }
+  
+  // Save changes to file
+  saveConfigToFile();
+}
+#endif
 
 // used only for FAKE messages
 void IRAM_ATTR sendLongBTMessage(unsigned char* body, int length) {
@@ -211,7 +322,52 @@ class BTCallback: public BLECharacteristicCallbacks {
     memcpy(msg.data, incoming.c_str(), copyLength);
     msg.length = copyLength;
 
-#ifndef FAKE
+#if defined(SIMULATOR)
+    // Simulator mode - handle messages locally without CAN
+    if (incoming[0] == 0x0A) {
+      // Read request - send hello data with simulator config
+      buildHelloDataFromConfig();
+      sendLongBTMessage(hello_data, WRITE_MSG_LENGTH);
+      Serial.println("SIMULATOR: Sent hello data");
+    } else if ((incoming[0] == 0x07) || (fillLevel != 0)) {
+      // Write request - update simulator config and respond
+      if (fillLevel < WRITE_MSG_LENGTH) {
+        // fill the buffer
+        memcpy(&simulatorConfig[fillLevel], msg.data, msg.length);
+        fillLevel = fillLevel + msg.length;
+        Serial.printf("SIMULATOR: Fill level now %d", fillLevel);
+        if (fillLevel == WRITE_MSG_LENGTH) {
+          updateConfigFromMessage(simulatorConfig, WRITE_MSG_LENGTH);
+          buildHelloDataFromConfig();
+          sendLongBTMessage(hello_data, WRITE_MSG_LENGTH);
+          Serial.println("SIMULATOR: Config updated and sent response");
+          fillLevel = 0;
+        }
+      } else {
+          Serial.println("SIMULATOR: Malfunction");
+          fillLevel = 0;
+      }
+    } else if (incoming[0] == 0x09) {
+      // Display data request - send fake display response
+      if ((min_voltage + delta_v) > max_voltage) {
+        delta_v = 0;
+      } else {
+        delta_v = delta_v + 1;
+      }
+      display_data[7] = highByte(min_voltage + delta_v);
+      display_data[8] = lowByte(min_voltage + delta_v);
+      display_data[9] = 10;
+      display_data[10] = random(128);
+      display_data[17] = random(255);
+      display_data[18] = random(175) + 50;
+      display_data[19] = random(175) + 50;
+      sendLongBTMessage(display_data, DISPLAY_MSG_LENGTH);
+      #ifdef DEBUG
+      Serial.println("SIMULATOR: Sent display data");
+      #endif
+    }
+#elif !defined(FAKE)
+    // Normal mode - send to CAN queue
     // Send to queue (blocks if queue is full — you can also use 0 timeout if you want non-blocking)
     if (xQueueSend(xQueue, &msg, portMAX_DELAY) != pdTRUE) {
       #ifdef DEBUG
@@ -277,7 +433,7 @@ void loop() {
 #ifdef DEBUG
       ESP_DRAM_LOGE("WD", "Reset WD %ld, result %d", now, result);
 #endif
-#ifdef FAKE
+#if defined(FAKE) || defined(SIMULATOR)
       if (deviceConnected) {
         speedo_data[7] = odometer;
         speedo_data[4] = odometer/10;
@@ -289,6 +445,8 @@ void loop() {
 #endif
   } // end of LED blinking and periodic WD reset
 
+#if !defined(SIMULATOR)
+  // Only process CAN messages in normal mode
   if (can_received) {
     if (can_packet_size != 0) {
       id = CAN.packetId();
@@ -330,6 +488,7 @@ void loop() {
       can_received = false;
     }
   }
+#endif
 }
 
 // Main BLE Server Callbacks
@@ -369,6 +528,29 @@ void setup() {
 
   Serial.println(F("WiFi disabled!"));
 
+#if defined(SIMULATOR)
+  if (!LittleFS.begin()) {
+    Serial.println("LittleFS mount failed");
+    return;
+  }
+  Serial.println("LittleFS mounted successfully");
+  
+  // Load configuration from file
+  configLoaded = loadConfigFromFile();
+  if (configLoaded) {
+    Serial.println(F("Config loaded from file!"));
+    buildHelloDataFromConfig();
+  } else {
+    Serial.println(F("No config file found or incomplete - using defaults"));
+    // Initialize with default values if file doesn't exist
+    for (int i = 0; i < CONFIG_DATA_SIZE; i++) {
+      simulatorConfig[i] = 0;
+    }
+  }
+#endif
+
+#if !defined(SIMULATOR)
+  // Only create CAN task in normal mode (not in simulator mode)
   xQueue = xQueueCreate(20, sizeof(BTMessage));
   if(xQueue != NULL) {
     xTaskCreatePinnedToCore(
@@ -416,6 +598,10 @@ void setup() {
   CAN.onReceive(CANCallback);
 
   Serial.println(F("CAN init ok!"));
+#else
+  // Simulator mode - skip CAN initialization
+  Serial.println(F("SIMULATOR MODE - CAN disabled"));
+#endif
 
   BLEDevice::init("MetaHack");
   pServer = BLEDevice::createServer();
