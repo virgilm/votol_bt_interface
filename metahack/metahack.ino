@@ -39,7 +39,7 @@ QueueHandle_t xQueue;
 #define WDT_TIMEOUT 10
 
 // #define FAKE // uncomment this to generate fake messages for app debugging
-// #define SIMULATOR // uncomment this to enable simulator mode with config file loading
+#define SIMULATOR // uncomment this to enable simulator mode with config file loading
 // #define DEBUG // uncomment this to print debug messages
 // Enabling DEBUG makes things unstable/WD crashes/lost messages, use SPARINGLY!
 // Absoultely no shipping code with DEBUG enabled!
@@ -324,18 +324,18 @@ class BTCallback: public BLECharacteristicCallbacks {
 
 #if defined(SIMULATOR)
     // Simulator mode - handle messages locally without CAN
-    if (incoming[0] == 0x0A) {
+    if (incoming[0] == 0x0A && incoming[1] == 0x55) {
       // Read request - send hello data with simulator config
       buildHelloDataFromConfig();
       sendLongBTMessage(hello_data, WRITE_MSG_LENGTH);
       Serial.println("SIMULATOR: Sent hello data");
-    } else if ((incoming[0] == 0x07) || (fillLevel != 0)) {
+    } else if ((incoming[0] == 0x07 && incoming[1] == 0x55) || (fillLevel != 0)) {
       // Write request - update simulator config and respond
       if (fillLevel < WRITE_MSG_LENGTH) {
         // fill the buffer
         memcpy(&simulatorConfig[fillLevel], msg.data, msg.length);
         fillLevel = fillLevel + msg.length;
-        Serial.printf("SIMULATOR: Fill level now %d", fillLevel);
+        Serial.printf("SIMULATOR: Fill level now %d\n", fillLevel);
         if (fillLevel == WRITE_MSG_LENGTH) {
           updateConfigFromMessage(simulatorConfig, WRITE_MSG_LENGTH);
           buildHelloDataFromConfig();
