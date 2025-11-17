@@ -40,7 +40,7 @@ QueueHandle_t xQueue;
 
 // #define FAKE // uncomment this to generate fake messages for app debugging
 #define SIMULATOR // uncomment this to enable simulator mode with config file loading
-// #define DEBUG // uncomment this to print debug messages
+#define DEBUG // uncomment this to print debug messages
 // Enabling DEBUG makes things unstable/WD crashes/lost messages, use SPARINGLY!
 // Absoultely no shipping code with DEBUG enabled!
 #define LED_ON
@@ -145,6 +145,28 @@ void swapBytePairs(unsigned char* config, const int* indices, int count) {
   }
 }
 
+// Computes CRC‑16/CCITT (poly 0x1021, initial 0) over `length` bytes pointed to by `data`.
+uint16_t crc16_ccitt(const uint8_t *data, size_t length) {
+#ifdef DEBUG
+      Serial.printf("CRC buffer First two bytes %02hhX and %02hhX\n", data[0], data[1]);
+      Serial.printf("CRC buffer Last two bytes %02hhX and %02hhX\n", data[length-2], data[length-1]);
+#endif
+  const uint16_t polynomial = 0x1021;
+  uint16_t crc = 0x0000;
+
+  for (size_t i = 0; i < length; ++i) {
+    crc ^= static_cast<uint16_t>(data[i]) << 8;
+    for (uint8_t bit = 0; bit < 8; ++bit) {
+      if (crc & 0x8000) {
+        crc = (crc << 1) ^ polynomial;
+      } else {
+        crc <<= 1;
+      }
+    }
+  }
+  return crc;
+}
+
 bool loadConfigFromFile() {
 // Load configuration from file
   File file = LittleFS.open(CONFIG_FILE_PATH, "r");
@@ -161,7 +183,7 @@ bool loadConfigFromFile() {
       int value = line.toInt();
       simulatorConfig[byteIndex] = (unsigned char )(value & 0xFF);
 #ifdef DEBUG
-      Serial.printf("Loaded index %d value %d \n", byteIndex, simulatorConfig[byteIndex]);
+      Serial.printf("Loaded index %d value %02hhX \n", byteIndex, simulatorConfig[byteIndex]);
 #endif
       byteIndex++;
     }
@@ -187,7 +209,7 @@ bool saveConfigToFile() {
   for (int i = 0; i < CONFIG_DATA_SIZE; i++) {
     file.printf("%d\n", simulatorConfig[i]);
 #ifdef DEBUG
-    Serial.printf("Byte %d written at %d\n", simulatorConfig[i], i);
+    Serial.printf("Byte %02hhX written at %d\n", simulatorConfig[i], i);
 #endif
   }
   file.close();
@@ -203,6 +225,14 @@ void buildHelloDataFromConfig() {
   hello_data[1] = 0x55;
   hello_data[2] = 0xAA;
   hello_data[3] = 0xAA;
+  hello_data[4] = 0x00;
+  hello_data[5] = 0xAA;
+  hello_data[6] = 0x00;
+  hello_data[7] = 0x00;
+  hello_data[8] = 0x37;
+  hello_data[9] = 0x55;
+  hello_data[10] = 0x00;
+  hello_data[11] = 0x00;
   
   // Copy config data (119 bytes) into hello_data starting at offset 4
   // hello_data is 136 bytes total
@@ -210,6 +240,14 @@ void buildHelloDataFromConfig() {
     hello_data[i + 12] = simulatorConfig[i];
   }
   // needs CRC or CRC should be ignored in iOS
+  uint16_t crc = crc16_ccitt(&hello_data[10], CONFIG_DATA_SIZE+2);
+  hello_data[131] = static_cast<uint8_t>(crc & 0x00FF);      // low byte first
+  hello_data[132] = static_cast<uint8_t>(crc >> 8);          // high byte second
+#ifdef DEBUG
+    Serial.printf("CRC low byte %02hhX \n", hello_data[131]);
+    Serial.printf("CRC high byte %02hhX \n", hello_data[132]);
+#endif
+
 }
 
 // Update simulator config from incoming write message
@@ -431,7 +469,7 @@ void loop() {
       result = esp_task_wdt_reset();
       last = now;
 #ifdef DEBUG
-      ESP_DRAM_LOGE("WD", "Reset WD %ld, result %d", now, result);
+//      ESP_DRAM_LOGE("WD", "Reset WD %ld, result %d", now, result);
 #endif
 #if defined(FAKE) || defined(SIMULATOR)
       if (deviceConnected) {
